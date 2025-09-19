@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TinyGo WebAssembly Demo</title>
+</head>
+<body>
+    <h1>TinyGo WebAssembly Demo</h1>
+    <p>Check the browser console for output!</p>
+    
+    <script>
+        // 简化的 TinyGo 运行时
+        class Go {
+            constructor() {
+                this.argv = ['js'];
+                this.env = {};
+                this.exited = false;
+                this.mem = null;
+                this._inst = null;
+                this._values = [NaN, 0, null, true, false, globalThis, this];
+                this._goRefCounts = new Array(this._values.length).fill(Infinity);
+                this._ids = new Map([[0, 1], [null, 2], [true, 3], [false, 4], [globalThis, 5], [this, 6]]);
+                this._idPool = [];
+                
+                const setInt64 = (addr, v) => {
+                    this.mem.setUint32(addr + 0, v);
+                    this.mem.setUint32(addr + 4, Math.floor(v / 4294967296));
+                };
+                
+                const getInt64 = (addr) => {
+                    const low = this.mem.getUint32(addr + 0);
+                    const high = this.mem.getInt32(addr + 4);
+                    return low + high * 4294967296;
+                };
+                
+                const loadValue = (addr) => {
+                    const f = this.mem.getFloat64(addr);
+                    if (f === 0) return undefined;
+                    if (!isNaN(f)) return f;
+                    const id = this.mem.getUint32(addr);
+                    return this._values[id];
+                };
+                
+                const storeValue = (addr, v) => {
+                    const nanHead = 0x7FF80000;
+                    if (typeof v === 'number' && v !== 0) {
+                        if (isNaN(v)) {
+                            this.mem.setUint32(addr + 4, nanHead);
+                            this.mem.setUint32(addr, 0);
+                            return;
+                        }
+                        this.mem.setFloat64(addr, v);
+                        return;
+                    }
+                    if (v === undefined) {
+                        this.mem.setFloat64(addr, 0);
+                        return;
+                    }
+                    
+                    let id = this._ids.get(v);
+                    if (id === undefined) {
+                        id = this._idPool.pop();
+                        if (id === undefined) {
+                            id = this._values.length;
+                        }
+                        this._values[id] = v;
+                        this._goRefCounts[id] = 0;
+                        this._ids.set(v, id);
+                    }
+                    this._goRefCounts[id]++;
+                    let typeFlag = 0;
+                    switch (typeof v) {
+                        case 'object': if (v !== null) typeFlag = 1; break;
+                        case 'string': typeFlag = 2; break;
+                        case 'symbol': typeFlag = 3; break;
+                        case 'function': typeFlag = 4; break;
+                    }
+                    this.mem.setUint32(addr + 4, nanHead | typeFlag);
+                    this.mem.setUint32(addr, id);
+                };
+                
+                this.importObject = {
+                    'wasi_snapshot_preview1': {
+                        'proc_exit': (code) => {
+                            console.log('WASI proc_exit:', code);
+                            this.exited = true;
+                        },
+                        'fd_write': (fd, iovs, iovs_len, nwritten) => {
+                            return 0;
+                        },
+                        'fd_close': (fd) => {
+                            return 0;
+                        },
+                        'random_get': (buf, buf_len) => {
+                            return 0;
+                        },
+                        'clock_time_get': (id, precision, time) => {
+                            return 0;
+                        },
+                        'environ_sizes_get': (count, buf_size) => {
+                            return 0;
+                        },
+                        'environ_get': (environ, environ_buf) => {
+                            return 0;
+                        },
+                        'args_sizes_get': (argc, argv_buf_size) => {
+                            return 0;
+                        },
+                        'args_get': (argv, argv_buf) => {
+                            return 0;
+                        }
+                    },
+                    gojs: {
+                        'runtime.ticks': () => {
+                            return performance.now();
+                        },
+                        'runtime.sleepTicks': (ticks) => {
+                            return 0;
+                        },
+                        'syscall/js.stringVal': (sp) => {
+                            storeValue(sp + 24, loadValue(sp + 8));
+                        },
+                        'runtime.wasmExit': (sp) => {
+                            const code = this.mem.getInt32(sp + 8);
+                            this.exited = true;
+                            console.log('Go exit:', code);
+                        },
+                        'runtime.wasmWrite': (sp) => {
+                            const fd = getInt64(sp + 8);
+                            const p = getInt64(sp + 16);
+                            const n = this.mem.getInt32(sp + 24);
+                            if (fd === 1 && this._inst && this._inst.exports.mem) {
+                                const text = new TextDecoder().decode(new Uint8Array(this._inst.exports.mem.buffer, p, n));
+                                console.log(text);
+                            }
+                        },
+                        'runtime.resetMemoryDataView': (sp) => {
+                            const memory = this._inst.exports.mem || this._inst.exports.memory;
+                            if (memory && memory.buffer) {
+                                this.mem = new DataView(memory.buffer);
+                                console.log('内存视图重置成功');
+                            } else {
+                                console.log('无法重置内存视图');
+                            }
+                        },
+                        'syscall/js.valueGet': (sp) => {
+                            const result = Reflect.get(loadValue(sp + 8), loadValue(sp + 16));
+                            storeValue(sp + 32, result);
+                        },
+                        'syscall/js.valueSet': (sp) => {
+                            Reflect.set(loadValue(sp + 8), loadValue(sp + 16), loadValue(sp + 32));
+                        },
+                        'syscall/js.valueIndex': (sp) => {
+                            storeValue(sp + 24, Reflect.get(loadValue(sp + 8), getInt64(sp + 16)));
+                        },
+                        'syscall/js.valueSetIndex': (sp) => {
+                            Reflect.set(loadValue(sp + 8), getInt64(sp + 16), loadValue(sp + 24));
+                        },
+                        'syscall/js.valueCall': (sp) => {
+                            try {
+                                const v = loadValue(sp + 8);
+                                const m = Reflect.get(v, loadValue(sp + 16));
+                                const args = loadValue(sp + 32);
+                                const result = Reflect.apply(m, v, args);
+                                storeValue(sp + 56, result);
+                                this.mem.setUint8(sp + 64, 1);
+                            } catch (err) {
+                                storeValue(sp + 56, err);
+                                this.mem.setUint8(sp + 64, 0);
+                            }
+                        },
+                        'syscall/js.valueNew': (sp) => {
+                            try {
+                                const v = loadValue(sp + 8);
+                                const args = loadValue(sp + 16);
+                                const result = Reflect.construct(v, args);
+                                storeValue(sp + 40, result);
+                                this.mem.setUint8(sp + 48, 1);
+                            } catch (err) {
+                                storeValue(sp + 40, err);
+                                this.mem.setUint8(sp + 48, 0);
+                            }
+                        },
+                        'syscall/js.valueLength': (sp) => {
+                            setInt64(sp + 16, parseInt(loadValue(sp + 8).length));
+                        },
+                        'syscall/js.valuePrepareString': (sp) => {
+                            const str = new TextEncoder().encode(String(loadValue(sp + 8)));
+                            storeValue(sp + 16, str);
+                            setInt64(sp + 24, 0);
+                            setInt64(sp + 32, str.length);
+                        },
+                        'syscall/js.valueLoadString': (sp) => {
+                            const str = loadValue(sp + 8);
+                            loadValue(sp + 16).set(str);
+                        },
+                        'syscall/js.valueInstanceOf': (sp) => {
+                            this.mem.setUint8(sp + 24, (loadValue(sp + 8) instanceof loadValue(sp + 16)) ? 1 : 0);
+                        },
+                        'syscall/js.copyBytesToGo': (sp) => {
+                            const dst = loadValue(sp + 8);
+                            const src = loadValue(sp + 16);
+                            if (!(dst instanceof Uint8Array) || !(src instanceof Uint8Array)) {
+                                this.mem.setUint8(sp + 32, 0);
+                                return;
+                            }
+                            const n = Math.min(dst.byteLength, src.byteLength);
+                            dst.set(src.subarray(0, n));
+                            setInt64(sp + 40, n);
+                            this.mem.setUint8(sp + 48, 1);
+                        },
+                        'syscall/js.copyBytesToJS': (sp) => {
+                            const dst = loadValue(sp + 8);
+                            const src = loadValue(sp + 16);
+                            if (!(dst instanceof Uint8Array) || !(src instanceof Uint8Array)) {
+                                this.mem.setUint8(sp + 32, 0);
+                                return;
+                            }
+                            const n = Math.min(dst.byteLength, src.byteLength);
+                            dst.set(src.subarray(0, n));
+                            setInt64(sp + 40, n);
+                            this.mem.setUint8(sp + 48, 1);
+                        },
+                        'syscall/js.finalizeRef': (sp) => {
+                            const id = this.mem.getUint32(sp + 8);
+                            this._goRefCounts[id]--;
+                            if (this._goRefCounts[id] === 0) {
+                                const v = this._values[id];
+                                this._values[id] = null;
+                                this._ids.delete(v);
+                                this._idPool.push(id);
+                            }
+                        }
+                    }
+                };
+            }
+            
+            async run(instance) {
+                this._inst = instance;
+                
+                // 尝试获取内存导出
+                const memory = this._inst.exports.mem || this._inst.exports.memory;
+                if (memory && memory.buffer) {
+                    this.mem = new DataView(memory.buffer);
+                    console.log('内存初始化成功');
+                } else {
+                    console.log('未找到内存导出，尝试其他方式');
+                    // 如果内存导出不存在，延迟初始化
+                    this.mem = null;
+                }
+                
+                // 运行 main 函数
+                if (this._inst.exports.run) {
+                    this._inst.exports.run();
+                }
+                
+                // 如果 main 函数存在，调用它
+                if (this._inst.exports.main) {
+                    this._inst.exports.main();
+                }
+            }
+        }
+        
+        // 初始化 TinyGo 运行时
+        const go = new Go();
+        
+        async function loadWasm() {
+            try {
+                console.log('正在加载 WASM...');
+                const response = await fetch('main.wasm');
+                const buffer = await response.arrayBuffer();
+                console.log('WASM 文件加载成功，大小:', buffer.byteLength, '字节');
+                
+                // 实例化 WASM
+                const result = await WebAssembly.instantiate(buffer, go.importObject);
+                console.log('WASM 实例化成功');
+                
+                // 检查实例和导出
+                if (result && result.instance && result.instance.exports) {
+                    console.log('可用导出函数:', Object.keys(result.instance.exports));
+                } else {
+                    console.log('无法访问 WASM 导出函数');
+                    if (result && result.instance) {
+                        console.log('instance 存在:', result.instance);
+                        console.log('exports 存在:', result.instance.exports);
+                    }
+                }
+                
+                // 检查内存是否已初始化
+                if (result.instance.exports.mem && result.instance.exports.mem.buffer) {
+                    console.log('内存已初始化，大小:', result.instance.exports.mem.buffer.byteLength, '字节');
+                } else {
+                    console.log('内存导出未找到，尝试其他方式访问内存');
+                    // 尝试通过其他方式访问内存
+                    const memory = result.instance.exports.memory || result.instance.exports.mem;
+                    if (memory && memory.buffer) {
+                        console.log('找到内存，大小:', memory.buffer.byteLength, '字节');
+                    }
+                }
+                
+                // 运行 TinyGo 运行时
+                await go.run(result.instance);
+                console.log('TinyGo 运行时初始化完成');
+                
+                // 调用导出的函数
+                if (result.instance.exports.add) {
+                    const sum = result.instance.exports.add(5, 3);
+                    console.log("5 + 3 =", sum);
+                } else {
+                    console.log('add 函数未找到');
+                }
+                
+            } catch (error) {
+                console.error('WASM 加载失败:', error);
+                console.error('错误详情:', error.message);
+            }
+        }
+        
+        // 页面加载完成后执行
+        window.addEventListener('DOMContentLoaded', loadWasm);
+    </script>
+</body>
+</html>
